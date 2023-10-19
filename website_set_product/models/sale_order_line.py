@@ -9,6 +9,11 @@ class SaleOrderLine(models.Model):
     set_product = fields.Boolean(
         "Set product?", related="product_id.product_tmpl_id.set_product"
     )
+    set_parent_product_id = fields.Many2one(
+        comodel_name="product.product",
+        string="Parent Product",
+        readonly=True,
+    )
 
     # @api.depends("product_id")
     # def _compute_set_product(self):
@@ -23,7 +28,6 @@ class SaleOrderLine(models.Model):
 
     def explode_set_contents(self):
         """Explodes order lines."""
-
         bom_obj = self.env["mrp.bom"].sudo()
         to_unlink_ids = self.env["sale.order.line"]
         to_explode_again_ids = self.env["sale.order.line"]
@@ -31,6 +35,11 @@ class SaleOrderLine(models.Model):
         for line in self.filtered(
             lambda l: l.set_product and l.state in ["draft", "sent"]
         ):
+            # Avoid using self in this loop, we are passing context to lines
+            if not (parent_id := line._context.get("set_parent_product_id", False)):
+                line = line.with_context(set_parent_product_id=line.product_id.id)
+                parent_id = line.product_id.id
+
             bom_dict = bom_obj._bom_find(products=line.product_id)
             customer_lang = line.order_id.partner_id.lang
             if not bom_dict:
@@ -52,20 +61,24 @@ class SaleOrderLine(models.Model):
                 )
 
                 for bom_line, data in lines:
-                    sol = self.env["sale.order.line"].new()
+                    product = data["target_product"]
+                    sol = line.env["sale.order.line"].new()
                     sol.order_id = line.order_id
-                    sol.product_id = bom_line.product_id
-                    sol.product_uom_qty = data["qty"]
+                    sol.product_id = product
+                    sol.set_parent_product_id = parent_id
+                    sol.product_uom_qty = data["qty"]  # data['qty']
                     # sol.product_id_change()
                     # sol.product_uom_change()
                     # sol._onchange_discount()
                     # sol._compute_amount()
-                    sol.name = bom_line.product_id.with_context(
+                    sol.name = product.with_context(
                         {"lang": customer_lang}
                     ).display_name
                     vals = sol._convert_to_write(sol._cache)
                     existing_sol = sol.order_id.order_line.filtered(
-                        lambda l: l.product_id == sol.product_id and l.id
+                        lambda l: l.id
+                        and l.product_id == sol.product_id
+                        and l.set_parent_product_id.id == parent_id
                     )
                     if existing_sol:
                         existing_sol.write(
@@ -75,7 +88,7 @@ class SaleOrderLine(models.Model):
                             }
                         )
                     else:
-                        sol_id = self.create(vals)
+                        sol_id = line.create(vals)
                         to_explode_again_ids |= sol_id
                 to_unlink_ids |= line
 
